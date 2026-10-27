@@ -118,7 +118,7 @@ class SAM3_DetectBatch(io.ComfyNode):
                 io.Float.Input("threshold", display_name="threshold", default=0.5, min=0.0, max=1.0, step=0.01),
                 io.Int.Input("refine_iterations", display_name="refine_iterations", default=1, min=0, max=5, tooltip="SAM decoder refinement passes. 0 uses the raw detector mask."),
                 io.Boolean.Input("individual_masks", display_name="individual_masks", default=False, tooltip="Output per-object masks instead of a union"),
-                io.Int.Input("frame_batch", display_name="frame_batch", default=8, min=1, max=32, tooltip="How many frames to detect at once. Each frame is still detected on its own; this only batches the GPU forward. Lower it if VRAM runs out."),
+                io.Int.Input("frame_batch", display_name="frame_batch", default=8, min=1, max=32, tooltip="Frames per forward. This does not reduce the amount of work; lower it if VRAM runs out."),
             ],
             outputs=[
                 io.Mask.Output("masks"),
@@ -150,12 +150,15 @@ class SAM3_DetectBatch(io.ComfyNode):
             refine_jobs = []
             refine_slots = []
 
+            # One ViT pass for every text prompt in this chunk. face and head used to
+            # each run the backbone, and a bigger frame_batch does not reduce that work.
+            detector = sam3_model.detector
+            trunk_out = detector.backbone["vision_backbone"].trunk(frames)
+            resizer = detector.backbone["language_backbone"]["resizer"]
+            del frames
             for text_embeddings, text_mask, max_det in cond_list:
-                # Leave masks at detector resolution. Upsampling every query to the
-                # original frame size allocates several gigabytes per chunk and OOMs.
-                results = sam3_model(
-                    frames, text_embeddings=text_embeddings, text_mask=text_mask,
-                    threshold=threshold)
+                prompt_mask = text_mask.bool() if text_mask is not None else None
+                results = detector.forward_from_trunk(trunk_out, resizer(text_embeddings), prompt_mask)
                 box_scale = results["boxes"].new_tensor([W, H, W, H])
                 for local in range(end - start):
                     pred_boxes = results["boxes"][local] * box_scale
@@ -176,10 +179,20 @@ class SAM3_DetectBatch(io.ComfyNode):
                             "width": float(box[2] - box[0]), "height": float(box[3] - box[1]),
                             "score": float(score),
                         })
-                    for coarse, box in zip(kept_masks, kept_boxes):
+                    if kept_masks.shape[0] == 0:
+                        continue
+                    if individual_masks:
+                        for coarse, box in zip(kept_masks, kept_boxes):
+                            refine_slots.append(local)
+                            refine_jobs.append((start + local, coarse, box))
+                    else:
+                        union_box = torch.stack([
+                            kept_boxes[:, 0].min(), kept_boxes[:, 1].min(),
+                            kept_boxes[:, 2].max(), kept_boxes[:, 3].max(),
+                        ])
                         refine_slots.append(local)
-                        refine_jobs.append((start + local, coarse, box))
-            del frames
+                        refine_jobs.append((start + local, kept_masks.max(dim=0).values, union_box))
+            del trunk_out
 
             if refine_jobs:
                 refined = _refine_masks_batch(
