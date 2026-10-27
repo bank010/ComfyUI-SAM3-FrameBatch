@@ -33,6 +33,27 @@ def _extract_text_prompts(conditioning, device, dtype):
     return [(emb, mask, 1)]
 
 
+def _frames_to_detect(image, max_skip, change_threshold):
+    """Detect on a frame, then reuse that mask while the picture stays similar.
+
+    A cut or other large change is detected immediately. max_skip also forces a
+    new detection so a slow head turn cannot keep an old mask for long.
+    """
+    count = image.shape[0]
+    if max_skip <= 0 or count <= 1:
+        return list(range(count))
+    small = F.interpolate(image[..., :3].movedim(-1, 1), size=(64, 64), mode="area")
+    diffs = (small[1:] - small[:-1]).abs().flatten(1).mean(1)
+    chosen = [0]
+    since = 0
+    for index, diff in enumerate(diffs.tolist(), start=1):
+        since += 1
+        if since > max_skip or diff >= change_threshold:
+            chosen.append(index)
+            since = 0
+    return chosen
+
+
 def _coarse_mask(coarse, H, W):
     return (F.interpolate(coarse.unsqueeze(0).unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False)[0] > 0).float()
 
@@ -118,7 +139,9 @@ class SAM3_DetectBatch(io.ComfyNode):
                 io.Float.Input("threshold", display_name="threshold", default=0.5, min=0.0, max=1.0, step=0.01),
                 io.Int.Input("refine_iterations", display_name="refine_iterations", default=1, min=0, max=5, tooltip="SAM decoder refinement passes. 0 uses the raw detector mask."),
                 io.Boolean.Input("individual_masks", display_name="individual_masks", default=False, tooltip="Output per-object masks instead of a union"),
-                io.Int.Input("frame_batch", display_name="frame_batch", default=8, min=1, max=32, tooltip="Frames per forward. This does not reduce the amount of work; lower it if VRAM runs out."),
+                io.Int.Input("frame_batch", display_name="frame_batch", default=8, min=1, max=32, tooltip="Frames packed into one forward. Lower it if VRAM runs out."),
+                io.Int.Input("max_skip", display_name="max_skip", default=3, min=0, max=30, tooltip="Reuse the last mask for this many similar frames. 0 detects every frame. A cut still forces a new detection."),
+                io.Float.Input("change_threshold", display_name="change_threshold", default=0.06, min=0.0, max=1.0, step=0.01, tooltip="Frame difference that forces a new detection. Lower it if motion is being missed."),
             ],
             outputs=[
                 io.Mask.Output("masks"),
@@ -127,7 +150,11 @@ class SAM3_DetectBatch(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, image, conditioning=None, threshold=0.5, refine_iterations=1, individual_masks=False, frame_batch=8) -> io.NodeOutput:
+    def execute(cls, model, image, conditioning=None, threshold=0.5, refine_iterations=1, individual_masks=False, frame_batch=8, max_skip=3, change_threshold=0.06) -> io.NodeOutput:
+        chosen = _frames_to_detect(image, max_skip, change_threshold)
+        full_count = image.shape[0]
+        if len(chosen) < full_count:
+            image = image[chosen]
         B, H, W, _ = image.shape
         comfy.model_management.load_model_gpu(model)
         device = comfy.model_management.get_torch_device()
@@ -214,6 +241,22 @@ class SAM3_DetectBatch(io.ComfyNode):
                 else:
                     all_masks.append(torch.zeros(H, W, device=idev))
             pbar.update(end - start)
+
+        if len(chosen) < full_count:
+            expanded_masks = []
+            expanded_boxes = []
+            cursor = 0
+            last_mask = None
+            last_boxes = None
+            for index in range(full_count):
+                if cursor < len(chosen) and chosen[cursor] == index:
+                    last_mask = all_masks[cursor]
+                    last_boxes = all_bbox_dicts[cursor]
+                    cursor += 1
+                expanded_masks.append(last_mask)
+                expanded_boxes.append(last_boxes)
+            all_masks = expanded_masks
+            all_bbox_dicts = expanded_boxes
 
         all_masks = [mask.to(idev) for mask in all_masks]
         mask_out = torch.cat(all_masks, dim=0) if individual_masks else torch.stack(all_masks)
