@@ -5,6 +5,10 @@ version = "1.0.0"
 license = {text = "GPL-3.0-or-later"}
 requires-python = ">=3.10"
 
+[project.urls]
+Repository = "https://github.com/bank010/ComfyUI-SAM3-FrameBatch"
+
 [tool.comfy]
+PublisherId = "bank010"
 DisplayName = "ComfyUI-SAM3-FrameBatch"
 Icon = ""
