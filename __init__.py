@@ -151,11 +151,14 @@ class SAM3_DetectBatch(io.ComfyNode):
             refine_slots = []
 
             for text_embeddings, text_mask, max_det in cond_list:
+                # Leave masks at detector resolution. Upsampling every query to the
+                # original frame size allocates several gigabytes per chunk and OOMs.
                 results = sam3_model(
                     frames, text_embeddings=text_embeddings, text_mask=text_mask,
-                    threshold=threshold, orig_size=(H, W))
+                    threshold=threshold)
+                box_scale = results["boxes"].new_tensor([W, H, W, H])
                 for local in range(end - start):
-                    pred_boxes = results["boxes"][local]
+                    pred_boxes = results["boxes"][local] * box_scale
                     scores = results["scores"][local]
                     masks = results["masks"][local]
                     probs = scores.sigmoid()
@@ -176,6 +179,7 @@ class SAM3_DetectBatch(io.ComfyNode):
                     for coarse, box in zip(kept_masks, kept_boxes):
                         refine_slots.append(local)
                         refine_jobs.append((start + local, coarse, box))
+            del frames
 
             if refine_jobs:
                 refined = _refine_masks_batch(
