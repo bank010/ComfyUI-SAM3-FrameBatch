@@ -65,6 +65,44 @@ face:8, head:6
 - 每个 chunk、每批细化都会检查 ComfyUI 的取消信号，长视频可以中断。
 - 文本 embedding 的 `resizer` 只跑一次，不再每个 chunk 重算。
 
+## 先测再调
+
+在启动 ComfyUI 前设置 `SAM3_FRAMEBATCH_TIMING=1`：
+
+```bash
+# Linux / macOS
+SAM3_FRAMEBATCH_TIMING=1 python main.py
+# Windows
+set SAM3_FRAMEBATCH_TIMING=1 && python main.py
+```
+
+跑一次后会打印一行：
+
+```text
+[SAM3 Detect Batch] frames=100 chunk=8 prompts=2 iters=1 individual=False dtype=torch.float16 total=... load=... pre=... trunk=... detect=... refine=... post=...
+```
+
+怎么看：
+
+- `trunk` 是检测阶段的 ViT，通常是最大头。
+- `refine` 是细化阶段的 crop 编码 + decoder。它接近 `total` 的一半时，把 `refine_iterations` 改成 0 就能直接减半。
+- `load` 很大说明模型在反复加载/offload，不是算子慢。
+- `dtype=torch.float32` 说明没跑半精度，速度会差很多。
+- `pre` 很大说明瓶颈在 CPU 预处理，优先降输入分辨率。
+
+## 减少耗时的顺序
+
+1. **`refine_iterations=0`**：省掉细化阶段的整次 ViT，通常直接减半。代价是掩码来自检测器的 288×288，边缘更粗；先对比一版，能接受就用。
+2. **确认 `individual_masks=false`**：true 会按目标逐个出 crop，目标一多就成倍变慢。
+3. **确认精度和 offload**：看上面的 `dtype`；再检查启动日志有没有 `lowvram` / `loaded partially`。显存够时用 `--highvram`，避免每次调用重新加载权重。
+4. **减少提示词数量**：每个提示词都要单独跑一遍检测头和一次细化 crop。`face:8, head:6` 如果只需要脸的掩码，就只留 `face`。
+5. **`frame_batch` 实测 4 / 8 / 16**：它主要影响显存，不改变总计算量；批量太小会浪费 GPU，太大则 OOM。显存修好后可以试着往上调。
+6. **输入先降到 1080p 或 720p**：ViT 固定 1008，降分辨率不会减少 ViT 计算，但能减少 CPU 预处理、crop 内存和最终掩码的写出时间。
+7. **抽帧**：如果 24fps 不需要逐帧掩码，每 2 帧检测一次再插值，耗时直接减半；切镜处要单独处理。
+8. **启动参数**：不要强制 `--use-split-cross-attention`；NVIDIA 上可以试 `--fast fp16_accumulation autotune`（可能小幅提速，属实验项）。`--force-fp16` 只在 `dtype` 不是 fp16 时用。
+
+SAM3 的视觉主干在 1008×1008 下每帧约 5 TFLOPs，100 帧就是几百 TFLOPs。4090 级别通常十几到二十几秒，3060 级别一分多钟是正常量级；如果你的机器远高于这个量级，优先查 `dtype`、offload 和启动参数，而不是继续调 `frame_batch`。
+
 ## 性能预期
 
 下表是每个 chunk（8 帧）里 1008×1008 ViT 前向的次数，不含检测头、decoder 和预处理。每次前向都是 batch=8：
@@ -99,6 +137,6 @@ face:8, head:6
 python -m unittest discover -s tests -v
 ```
 
-17 个用例在 CPU 上约 0.2 秒跑完。测试环境需要 PyTorch，可以直接用 ComfyUI 自带的 Python。
+18 个用例在 CPU 上约 0.2 秒跑完。测试环境需要 PyTorch，可以直接用 ComfyUI 自带的 Python。
 
 更详细的代码审查和逐条问题记录见 [REVIEW.md](REVIEW.md)。

@@ -1,5 +1,8 @@
 """SAM3 text detection in frame chunks. Leaves ComfyUI core unchanged."""
 
+import os
+import time
+
 import torch
 import torch.nn.functional as F
 from typing_extensions import override
@@ -15,6 +18,22 @@ CROP_PAD = 0.1
 # Two crops are merged when the smaller box is at least this much inside the
 # larger one. "face" and "head" share a crop; distant objects keep their own.
 MERGE_CONTAINMENT = 0.8
+# Opt-in profiling: SAM3_FRAMEBATCH_TIMING=1 prints a per-stage breakdown.
+_TIMING = os.environ.get("SAM3_FRAMEBATCH_TIMING") == "1"
+
+
+def _clock(device):
+    """Wall clock that also waits for async GPU work, for honest stage timings."""
+    if not _TIMING:
+        return 0.0
+    if device is not None:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        elif device.type == "xpu" and hasattr(torch, "xpu"):
+            torch.xpu.synchronize()
+        elif device.type == "mps" and hasattr(torch, "mps"):
+            torch.mps.synchronize()
+    return time.perf_counter()
 
 
 def _extract_text_prompts(conditioning, device, dtype):
@@ -273,9 +292,16 @@ class SAM3_DetectBatch(io.ComfyNode):
         if conditioning is None or len(conditioning) == 0:
             raise ValueError("SAM3 Detect Batch needs text conditioning (CLIPTextEncode with a SAM3 CLIP).")
 
+        load_start = time.perf_counter() if _TIMING else 0.0
         comfy.model_management.load_model_gpu(model)
         device = comfy.model_management.get_torch_device()
         dtype = model.model.get_dtype()
+        timing = None
+        if _TIMING:
+            now = _clock(device)
+            timing = {"load": now - load_start, "pre": 0.0, "trunk": 0.0,
+                      "detect": 0.0, "refine": 0.0, "post": 0.0}
+            mark = now
         sam3_model = getattr(model.model, "diffusion_model", None)
         if sam3_model is None or not hasattr(sam3_model, "detector"):
             raise ValueError("SAM3 Detect Batch needs a SAM3/SAM3.1 checkpoint.")
@@ -301,6 +327,10 @@ class SAM3_DetectBatch(io.ComfyNode):
             frames = comfy.utils.common_upscale(
                 image[start:end, ..., :3].movedim(-1, 1), ENCODER_SIZE, ENCODER_SIZE, "bilinear", crop="disabled"
             ).to(device=device, dtype=dtype)
+            if timing is not None:
+                now = _clock(device)
+                timing["pre"] += now - mark
+                mark = now
 
             chunk_boxes = [[] for _ in range(n)]
             union_parts = [[] for _ in range(n)]
@@ -312,6 +342,10 @@ class SAM3_DetectBatch(io.ComfyNode):
             detector = sam3_model.detector
             trunk_out = detector.backbone["vision_backbone"].trunk(frames)
             del frames
+            if timing is not None:
+                now = _clock(device)
+                timing["trunk"] += now - mark
+                mark = now
             for text_embeddings, text_mask, max_det in prompts:
                 prompt_mask = text_mask.bool() if text_mask is not None else None
                 results = detector.forward_from_trunk(trunk_out, text_embeddings, prompt_mask)
@@ -354,6 +388,10 @@ class SAM3_DetectBatch(io.ComfyNode):
                 del masks
                 del results
             del trunk_out
+            if timing is not None:
+                now = _clock(device)
+                timing["detect"] += now - mark
+                mark = now
 
             if individual_masks:
                 jobs, slots = individual_jobs, individual_slots
@@ -370,6 +408,10 @@ class SAM3_DetectBatch(io.ComfyNode):
                     sam3_model, image, jobs, H, W, device, dtype, refine_iterations, chunk)
                 for local, mask in zip(slots, refined):
                     frame_masks[local].append(mask)
+            if timing is not None:
+                now = _clock(device)
+                timing["refine"] += now - mark
+                mark = now
 
             for local in range(n):
                 all_bbox_dicts.append(chunk_boxes[local])
@@ -385,9 +427,26 @@ class SAM3_DetectBatch(io.ComfyNode):
                 else:
                     mask_out[start + local].zero_()
             pbar.update(n)
+            if timing is not None:
+                now = _clock(device)
+                timing["post"] += now - mark
+                mark = now
 
         if individual_masks:
             mask_out = torch.cat(all_masks, dim=0) if all_masks else torch.zeros(0, H, W, device=idev)
+
+        if timing is not None:
+            now = _clock(device)
+            timing["post"] += now - mark
+            print(
+                f"[SAM3 Detect Batch] frames={B} chunk={chunk} prompts={len(prompts)} "
+                f"iters={refine_iterations} individual={individual_masks} dtype={dtype} "
+                f"total={now - load_start:.2f}s load={timing['load']:.2f}s "
+                f"pre={timing['pre']:.2f}s trunk={timing['trunk']:.2f}s "
+                f"detect={timing['detect']:.2f}s refine={timing['refine']:.2f}s "
+                f"post={timing['post']:.2f}s",
+                flush=True,
+            )
         return io.NodeOutput(mask_out, all_bbox_dicts)
 
 

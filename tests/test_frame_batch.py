@@ -10,7 +10,9 @@ tracker produces the same mask whether the encoder output is reused or
 recomputed, so the fast path and the fallback path can be compared directly.
 """
 
+import contextlib
 import importlib.util
+import io
 import sys
 import types
 import unittest
@@ -308,6 +310,20 @@ class NodeTests(unittest.TestCase):
         self.assertEqual(self.sam.tracker.head_calls, 0)
         self.assertEqual(self.sam.forward_segment_calls, 0)
         self.assertGreater(masks.sum().item(), 0)
+
+    def test_timing_log(self):
+        old = NODE._TIMING
+        NODE._TIMING = True
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                self.run_node()
+        finally:
+            NODE._TIMING = old
+        out = buf.getvalue()
+        self.assertIn("[SAM3 Detect Batch]", out)
+        self.assertIn("trunk=", out)
+        self.assertIn("refine=", out)
 
     def test_detector_masks_freed_before_refine(self):
         """The [B, Q, h, w] mask tensor must not stay alive during refinement."""
