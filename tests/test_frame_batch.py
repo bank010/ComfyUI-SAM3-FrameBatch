@@ -130,12 +130,14 @@ class FakeVisionBackbone:
 
     def __init__(self):
         self.trunk_calls = 0
+        self.trunk_batches = []
         self.encode_calls = 0
         self.encoded_batches = []
         self.levels = 3
 
     def trunk(self, frames):
         self.trunk_calls += 1
+        self.trunk_batches.append(frames.shape[0])
         return torch.zeros(frames.shape[0], 4, 2, 2)
 
     def __call__(self, images, need_tracker=False, tracker_mode=None):
@@ -267,11 +269,13 @@ class NodeTests(unittest.TestCase):
         self.sam = FakeSAM3Model(H, W, default_specs())
         self.model = FakeModelPatcher(self.sam)
 
-    def run_node(self, batch=1, keys=(1.0,), max_dets=None, **kwargs):
+    def run_node(self, batch=1, keys=(1.0,), max_dets=None, image=None, **kwargs):
         params = dict(threshold=0.5, refine_iterations=1, individual_masks=False, frame_batch=8)
         params.update(kwargs)
+        if image is None:
+            image = make_image(batch)
         return NODE.SAM3_DetectBatch.execute(
-            self.model, make_image(batch), make_conditioning(keys, max_dets), **params
+            self.model, image, make_conditioning(keys, max_dets), **params
         )
 
     # -- contract -----------------------------------------------------------
@@ -351,6 +355,38 @@ class NodeTests(unittest.TestCase):
             NODE._refine_masks_batch = original_refine
             self.sam.detector.forward_from_trunk = original_forward
         self.assertEqual(freed_at_refine, [True])
+
+    # -- frame skipping -----------------------------------------------------
+
+    def test_frames_to_detect_max_skip(self):
+        chosen = NODE._frames_to_detect(torch.zeros(5, H, W, 3), 2, 0.06)
+        self.assertEqual(chosen, [0, 3])
+
+    def test_frames_to_detect_cut(self):
+        image = torch.zeros(6, H, W, 3)
+        image[3:] = 1.0
+        chosen = NODE._frames_to_detect(image, 10, 0.06)
+        self.assertEqual(chosen, [0, 3])
+
+    def test_skip_repeats_last_mask(self):
+        masks, boxes = self.run_node(batch=5, max_skip=2, image=torch.zeros(5, H, W, 3)).args
+        self.assertEqual(tuple(masks.shape), (5, H, W))
+        self.assertEqual(len(boxes), 5)
+        self.assertTrue(all(len(b) == 1 for b in boxes))
+        self.assertEqual(self.sam.vision.trunk_batches, [2])
+        self.assertTrue(torch.equal(masks[1], masks[0]))
+        self.assertTrue(torch.equal(masks[2], masks[0]))
+        self.assertTrue(torch.equal(masks[4], masks[3]))
+
+    def test_skip_individual_masks(self):
+        masks, boxes = self.run_node(
+            batch=5, keys=(3.0,), max_dets=[2], individual_masks=True,
+            max_skip=2, image=torch.zeros(5, H, W, 3),
+        ).args
+        self.assertEqual(masks.shape[0], 10)
+        self.assertEqual(tuple(masks.shape[1:]), (H, W))
+        self.assertEqual(len(boxes), 5)
+        self.assertTrue(all(len(b) == 2 for b in boxes))
 
     # -- encoder reuse ------------------------------------------------------
 

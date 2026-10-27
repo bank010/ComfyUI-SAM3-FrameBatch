@@ -60,6 +60,27 @@ def _extract_text_prompts(conditioning, device, dtype):
     return [(emb, mask, 1)]
 
 
+def _frames_to_detect(image, max_skip, change_threshold):
+    """Detect on a frame, then reuse that mask while the picture stays similar.
+
+    A cut or other large change is detected immediately. max_skip also forces a
+    new detection so a slow head turn cannot keep an old mask for long.
+    """
+    count = image.shape[0]
+    if max_skip <= 0 or count <= 1:
+        return list(range(count))
+    small = F.interpolate(image[..., :3].movedim(-1, 1), size=(64, 64), mode="area")
+    diffs = (small[1:] - small[:-1]).abs().flatten(1).mean(1)
+    chosen = [0]
+    since = 0
+    for index, diff in enumerate(diffs.tolist(), start=1):
+        since += 1
+        if since > max_skip or diff >= change_threshold:
+            chosen.append(index)
+            since = 0
+    return chosen
+
+
 def _coarse_mask(coarse, H, W):
     return (F.interpolate(coarse.unsqueeze(0).unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False)[0] > 0).float()
 
@@ -274,7 +295,9 @@ class SAM3_DetectBatch(io.ComfyNode):
                 io.Float.Input("threshold", display_name="threshold", default=0.5, min=0.0, max=1.0, step=0.01),
                 io.Int.Input("refine_iterations", display_name="refine_iterations", default=1, min=0, max=5, tooltip="SAM decoder refinement passes. 0 uses the raw detector mask."),
                 io.Boolean.Input("individual_masks", display_name="individual_masks", default=False, tooltip="Output per-object masks instead of a union"),
-                io.Int.Input("frame_batch", display_name="frame_batch", default=8, min=1, max=32, tooltip="Frames per forward. This does not reduce the amount of work; lower it if VRAM runs out."),
+                io.Int.Input("frame_batch", display_name="frame_batch", default=8, min=1, max=32, tooltip="Frames packed into one forward. Lower it if VRAM runs out."),
+                io.Int.Input("max_skip", display_name="max_skip", default=0, min=0, max=30, tooltip="0 detects every frame. Above 0 reuses the last mask on similar frames and can miss motion in a different video."),
+                io.Float.Input("change_threshold", display_name="change_threshold", default=0.06, min=0.0, max=1.0, step=0.01, tooltip="Frame difference that forces a new detection. Lower it if motion is being missed."),
             ],
             outputs=[
                 io.Mask.Output("masks"),
@@ -283,7 +306,11 @@ class SAM3_DetectBatch(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, image, conditioning=None, threshold=0.5, refine_iterations=1, individual_masks=False, frame_batch=8) -> io.NodeOutput:
+    def execute(cls, model, image, conditioning=None, threshold=0.5, refine_iterations=1, individual_masks=False, frame_batch=8, max_skip=0, change_threshold=0.06) -> io.NodeOutput:
+        chosen = _frames_to_detect(image, max_skip, change_threshold)
+        full_count = image.shape[0]
+        if len(chosen) < full_count:
+            image = image[chosen]
         B, H, W, _ = image.shape
         idev = comfy.model_management.intermediate_device()
 
@@ -312,12 +339,15 @@ class SAM3_DetectBatch(io.ComfyNode):
         prompts = [(resizer(emb), mask, max_det) for emb, mask, max_det in cond_list]
 
         chunk = max(1, int(frame_batch))
-        all_bbox_dicts = []
+        # ``image`` only contains the frames selected by _frames_to_detect, but
+        # the outputs always cover the full input batch. Skipped frames repeat
+        # the last detected mask/boxes.
+        all_bbox_dicts = [None] * full_count
         all_masks = [] if individual_masks else None
         if not individual_masks:
             # Writing into one buffer avoids keeping a per-frame list and then
             # copying it all again in torch.stack (2x peak RAM on long videos).
-            mask_out = torch.empty((B, H, W), dtype=torch.float32, device=idev)
+            mask_out = torch.empty((full_count, H, W), dtype=torch.float32, device=idev)
         pbar = comfy.utils.ProgressBar(B)
 
         for start in range(0, B, chunk):
@@ -414,7 +444,8 @@ class SAM3_DetectBatch(io.ComfyNode):
                 mark = now
 
             for local in range(n):
-                all_bbox_dicts.append(chunk_boxes[local])
+                original_index = chosen[start + local]
+                all_bbox_dicts[original_index] = chunk_boxes[local]
                 masks = frame_masks[local]
                 if individual_masks:
                     if masks:
@@ -423,9 +454,9 @@ class SAM3_DetectBatch(io.ComfyNode):
                         all_masks.append(torch.zeros(0, H, W, device=idev))
                 elif masks:
                     combined = torch.cat(masks, dim=0)
-                    mask_out[start + local] = (combined > 0).any(dim=0).float()
+                    mask_out[original_index] = (combined > 0).any(dim=0).float()
                 else:
-                    mask_out[start + local].zero_()
+                    mask_out[original_index].zero_()
             pbar.update(n)
             if timing is not None:
                 now = _clock(device)
@@ -433,18 +464,42 @@ class SAM3_DetectBatch(io.ComfyNode):
                 mark = now
 
         if individual_masks:
-            mask_out = torch.cat(all_masks, dim=0) if all_masks else torch.zeros(0, H, W, device=idev)
+            expanded_masks = [None] * full_count
+            cursor = 0
+            last_mask = None
+            for index in range(full_count):
+                if cursor < B and chosen[cursor] == index:
+                    last_mask = all_masks[cursor]
+                    cursor += 1
+                expanded_masks[index] = last_mask
+            mask_out = torch.cat(expanded_masks, dim=0) if expanded_masks else torch.zeros(0, H, W, device=idev)
+        else:
+            cursor = 0
+            last_mask = None
+            for index in range(full_count):
+                if cursor < B and chosen[cursor] == index:
+                    last_mask = mask_out[index]
+                    cursor += 1
+                else:
+                    mask_out[index].copy_(last_mask)
+
+        last_boxes = None
+        for index in range(full_count):
+            if all_bbox_dicts[index] is not None:
+                last_boxes = all_bbox_dicts[index]
+            else:
+                all_bbox_dicts[index] = last_boxes
 
         if timing is not None:
             now = _clock(device)
             timing["post"] += now - mark
             print(
-                f"[SAM3 Detect Batch] frames={B} chunk={chunk} prompts={len(prompts)} "
-                f"iters={refine_iterations} individual={individual_masks} dtype={dtype} "
-                f"total={now - load_start:.2f}s load={timing['load']:.2f}s "
-                f"pre={timing['pre']:.2f}s trunk={timing['trunk']:.2f}s "
-                f"detect={timing['detect']:.2f}s refine={timing['refine']:.2f}s "
-                f"post={timing['post']:.2f}s",
+                f"[SAM3 Detect Batch] frames={full_count} detect_frames={B} chunk={chunk} "
+                f"prompts={len(prompts)} iters={refine_iterations} individual={individual_masks} "
+                f"skip={max_skip} dtype={dtype} total={now - load_start:.2f}s "
+                f"load={timing['load']:.2f}s pre={timing['pre']:.2f}s "
+                f"trunk={timing['trunk']:.2f}s detect={timing['detect']:.2f}s "
+                f"refine={timing['refine']:.2f}s post={timing['post']:.2f}s",
                 flush=True,
             )
         return io.NodeOutput(mask_out, all_bbox_dicts)

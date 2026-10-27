@@ -26,6 +26,8 @@ face:8, head:6
 | `refine_iterations` | 1 | SAM decoder 细化次数；0 表示直接用检测器掩码 |
 | `individual_masks` | false | 每个目标一张掩码，而不是每帧一张并集 |
 | `frame_batch` | 8 | 每次前向的帧数；显存不够时改成 4 或 2 |
+| `max_skip` | 0 | 0 表示每帧都检测；大于 0 时在相似帧复用上一帧的掩码，切镜会强制重检 |
+| `change_threshold` | 0.06 | 帧差超过这个值就重新检测；调低可以更敏感 |
 
 输出：
 
@@ -79,7 +81,7 @@ set SAM3_FRAMEBATCH_TIMING=1 && python main.py
 跑一次后会打印一行：
 
 ```text
-[SAM3 Detect Batch] frames=100 chunk=8 prompts=2 iters=1 individual=False dtype=torch.float16 total=... load=... pre=... trunk=... detect=... refine=... post=...
+[SAM3 Detect Batch] frames=100 detect_frames=100 chunk=8 prompts=2 iters=1 individual=False skip=0 dtype=torch.float16 total=... load=... pre=... trunk=... detect=... refine=... post=...
 ```
 
 怎么看：
@@ -89,17 +91,19 @@ set SAM3_FRAMEBATCH_TIMING=1 && python main.py
 - `load` 很大说明模型在反复加载/offload，不是算子慢。
 - `dtype=torch.float32` 说明没跑半精度，速度会差很多。
 - `pre` 很大说明瓶颈在 CPU 预处理，优先降输入分辨率。
+- `detect_frames` 明显小于 `frames` 说明跳帧生效了，`max_skip` 在复用掩码。
 
 ## 减少耗时的顺序
 
 1. **`refine_iterations=0`**：省掉细化阶段的整次 ViT，通常直接减半。代价是掩码来自检测器的 288×288，边缘更粗；先对比一版，能接受就用。
-2. **确认 `individual_masks=false`**：true 会按目标逐个出 crop，目标一多就成倍变慢。
-3. **确认精度和 offload**：看上面的 `dtype`；再检查启动日志有没有 `lowvram` / `loaded partially`。显存够时用 `--highvram`，避免每次调用重新加载权重。
-4. **减少提示词数量**：每个提示词都要单独跑一遍检测头和一次细化 crop。`face:8, head:6` 如果只需要脸的掩码，就只留 `face`。
-5. **`frame_batch` 实测 4 / 8 / 16**：它主要影响显存，不改变总计算量；批量太小会浪费 GPU，太大则 OOM。显存修好后可以试着往上调。
-6. **输入先降到 1080p 或 720p**：ViT 固定 1008，降分辨率不会减少 ViT 计算，但能减少 CPU 预处理、crop 内存和最终掩码的写出时间。
-7. **抽帧**：如果 24fps 不需要逐帧掩码，每 2 帧检测一次再插值，耗时直接减半；切镜处要单独处理。
-8. **启动参数**：不要强制 `--use-split-cross-attention`；NVIDIA 上可以试 `--fast fp16_accumulation autotune`（可能小幅提速，属实验项）。`--force-fp16` 只在 `dtype` 不是 fp16 时用。
+2. **`max_skip` > 0**：相似帧复用上一帧掩码，动作慢/固定机位时能按 `1/(1+max_skip)` 减少检测次数；切镜会强制重检，但跨镜头复用仍可能漏动作，默认 0 是为了安全。
+3. **确认 `individual_masks=false`**：true 会按目标逐个出 crop，目标一多就成倍变慢。
+4. **确认精度和 offload**：看上面的 `dtype`；再检查启动日志有没有 `lowvram` / `loaded partially`。显存够时用 `--highvram`，避免每次调用重新加载权重。
+5. **减少提示词数量**：每个提示词都要单独跑一遍检测头和一次细化 crop。`face:8, head:6` 如果只需要脸的掩码，就只留 `face`。
+6. **`frame_batch` 实测 4 / 8 / 16**：它主要影响显存，不改变总计算量；批量太小会浪费 GPU，太大则 OOM。显存修好后可以试着往上调。
+7. **输入先降到 1080p 或 720p**：ViT 固定 1008，降分辨率不会减少 ViT 计算，但能减少 CPU 预处理、crop 内存和最终掩码的写出时间。
+8. **抽帧**：如果 24fps 不需要逐帧掩码，每 2 帧检测一次再插值，耗时直接减半；切镜处要单独处理。
+9. **启动参数**：不要强制 `--use-split-cross-attention`；NVIDIA 上可以试 `--fast fp16_accumulation autotune`（可能小幅提速，属实验项）。`--force-fp16` 只在 `dtype` 不是 fp16 时用。
 
 SAM3 的视觉主干在 1008×1008 下每帧约 5 TFLOPs，100 帧就是几百 TFLOPs。4090 级别通常十几到二十几秒，3060 级别一分多钟是正常量级；如果你的机器远高于这个量级，优先查 `dtype`、offload 和启动参数，而不是继续调 `frame_batch`。
 
@@ -114,6 +118,8 @@ SAM3 的视觉主干在 1008×1008 下每帧约 5 TFLOPs，100 帧就是几百 T
 | 2 个重叠提示词，1 次细化 | 3 | 2 |
 | 2 个重叠提示词，2 次细化 | 5 | 2 |
 | 2 个分离提示词，2 次细化 | 5 | 3 |
+
+上表按每帧都检测计算；`max_skip>0` 会把检测帧数降到 `detect_frames`，但跳过的帧直接复用上一帧掩码。
 
 单提示词、单次细化时速度基本不变，收益主要在显存和内存；多提示词、多次细化时细化部分的编码开销按上表下降。实际耗时还取决于 GPU、分辨率和 `individual_masks`，建议用自己的素材对比。
 
@@ -137,6 +143,6 @@ SAM3 的视觉主干在 1008×1008 下每帧约 5 TFLOPs，100 帧就是几百 T
 python -m unittest discover -s tests -v
 ```
 
-18 个用例在 CPU 上约 0.2 秒跑完。测试环境需要 PyTorch，可以直接用 ComfyUI 自带的 Python。
+22 个用例在 CPU 上约 0.3 秒跑完。测试环境需要 PyTorch，可以直接用 ComfyUI 自带的 Python。
 
 更详细的代码审查和逐条问题记录见 [REVIEW.md](REVIEW.md)。

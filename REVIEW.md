@@ -72,12 +72,12 @@
 - 新增 `_group_crops()`：同帧跨提示词按“交集 / 较小框面积 ≥ 0.8”合并 crop，远景目标不合并。
 - `_prepare_refine()` 不再提前放大 crop。
 - `_refine_masks_batch()` 每批只编码一次；结果直接 `.cpu()`；去掉空转的 interpolate。
-- `execute()`：预分配并集输出、按帧写入、空 batch 早退、缺 conditioning/非 SAM3 报错、取消检查、`del results`/`del masks`、`resizer` 提前；`SAM3_FRAMEBATCH_TIMING=1` 时输出分区耗时。
+- `execute()`：保留 main 的 `max_skip`/`change_threshold` 跳帧逻辑，输出按完整帧数映射（跳过的帧复用上一帧 mask/bbox）；预分配并集输出、空 batch 早退、缺 conditioning/非 SAM3 报错、取消检查、`del results`/`del masks`、`resizer` 提前；`SAM3_FRAMEBATCH_TIMING=1` 时输出分区耗时。
 - 输出形状、bbox 字典格式、`individual_masks` 语义保持兼容。
 
 `tests/test_frame_batch.py`：
 
-- 18 个 CPU 用例，不加载权重；
+- 22 个 CPU 用例，不加载权重；
 - 假模型可以验证“编码调用次数”，从而直接锁住第 5、6、11 项优化；
 - fast path 与 fallback 输出逐元素相等；
 - 覆盖 SAM3 非 multiplex 和 SAM3.1 multiplex 两条编码分支。
@@ -96,7 +96,7 @@
 
 ```text
 $ python -m unittest discover -s tests -v
-Ran 18 tests in 0.179s
+Ran 22 tests in 0.286s
 OK
 ```
 
