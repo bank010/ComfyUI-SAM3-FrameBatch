@@ -1,0 +1,10 @@
+[project]
+name = "comfyui-sam3-framebatch"
+description = "SAM3 text detection that runs several frames in one forward."
+version = "1.0.0"
+license = {text = "GPL-3.0-or-later"}
+requires-python = ">=3.10"
+
+[tool.comfy]
+DisplayName = "ComfyUI-SAM3-FrameBatch"
+Icon = ""
