@@ -140,7 +140,7 @@ class SAM3_DetectBatch(io.ComfyNode):
                 io.Int.Input("refine_iterations", display_name="refine_iterations", default=1, min=0, max=5, tooltip="SAM decoder refinement passes. 0 uses the raw detector mask."),
                 io.Boolean.Input("individual_masks", display_name="individual_masks", default=False, tooltip="Output per-object masks instead of a union"),
                 io.Int.Input("frame_batch", display_name="frame_batch", default=8, min=1, max=32, tooltip="Frames packed into one forward. Lower it if VRAM runs out."),
-                io.Int.Input("max_skip", display_name="max_skip", default=3, min=0, max=30, tooltip="Reuse the last mask for this many similar frames. 0 detects every frame. A cut still forces a new detection."),
+                io.Int.Input("max_skip", display_name="max_skip", default=0, min=0, max=30, tooltip="0 detects every frame. Above 0 reuses the last mask on similar frames and can miss motion in a different video."),
                 io.Float.Input("change_threshold", display_name="change_threshold", default=0.06, min=0.0, max=1.0, step=0.01, tooltip="Frame difference that forces a new detection. Lower it if motion is being missed."),
             ],
             outputs=[
@@ -150,7 +150,7 @@ class SAM3_DetectBatch(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, image, conditioning=None, threshold=0.5, refine_iterations=1, individual_masks=False, frame_batch=8, max_skip=3, change_threshold=0.06) -> io.NodeOutput:
+    def execute(cls, model, image, conditioning=None, threshold=0.5, refine_iterations=1, individual_masks=False, frame_batch=8, max_skip=0, change_threshold=0.06) -> io.NodeOutput:
         chosen = _frames_to_detect(image, max_skip, change_threshold)
         full_count = image.shape[0]
         if len(chosen) < full_count:
